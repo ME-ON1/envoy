@@ -43,6 +43,7 @@ class OverloadAction {
 public:
   static absl::StatusOr<std::unique_ptr<OverloadAction>>
   create(const envoy::config::overload::v3::OverloadAction& config, Stats::Scope& stats_scope);
+  create(const envoy::config::overload::v3::ScaleTimersOverloadActionConfig& config, Stats::Scope& stats_scope);
 
   // Updates the current pressure for the given resource and returns whether the action
   // has changed state.
@@ -232,8 +233,7 @@ private:
   std::shared_ptr<absl::node_hash_map<OverloadProactiveResourceName, ProactiveResource>>
       proactive_resources_;
 
-  absl::node_hash_map<NamedOverloadActionSymbolTable::Symbol, std::unique_ptr<OverloadAction>>
-      actions_;
+  ActionTableMap actions_;
 
   absl::flat_hash_map<std::string, std::unique_ptr<LoadShedPointImpl>> loadshed_points_;
 
@@ -248,6 +248,8 @@ private:
   using ResourceToActionMap =
       std::unordered_multimap<std::string, NamedOverloadActionSymbolTable::Symbol>;
   ResourceToActionMap resource_to_actions_;
+
+  using ActionTableMap =  absl::node_hash_map<NamedOverloadActionSymbolTable::Symbol, std::unique_ptr<OverloadAction>>;
 
   using ActionToCallbackMap =
       std::unordered_multimap<NamedOverloadActionSymbolTable::Symbol, ActionCallback,
