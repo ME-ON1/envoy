@@ -131,6 +131,11 @@ message ScaleTimersOverloadActionConfig {
       // Sets the minimum duration as a percentage of the maximum value.
       type.v3.Percent min_scale = 3;
     }
+
+    // scaled triggers to controle Timetype timer scaling with granualar control
+    // max value will be choosen when scaled_triggers is present
+    // if not present actions triggers controls the timeouts
+    repeated Triggers scaled_triggers = 4 [(validation.rules).repeated = {min_items: 1}];
   }
 
   // A set of timer scaling rules to be applied.
