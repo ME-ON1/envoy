@@ -150,7 +150,10 @@ absl::StatusOr<Event::ScaledTimerType> parseTimerType(
 
 absl::StatusOr<Event::ScaledTimerTypeMap>
 parseTimerMinimums(const Protobuf::Any& typed_config,
-                   ProtobufMessage::ValidationVisitor& validation_visitor) {
+                   ProtobufMessage::ValidationVisitor& validation_visitor,
+                   Stats::Scope& stats_scope,
+                   const& NamedOverloadActionSymbolTable scaled_trigger_action_symbol_table_,
+                   ActionTableMap& actions_) {
   using Config = envoy::config::overload::v3::ScaleTimersOverloadActionConfig;
   const Config action_config =
       MessageUtil::anyConvertAndValidate<Config>(typed_config, validation_visitor);
@@ -168,6 +171,22 @@ parseTimerMinimums(const Protobuf::Any& typed_config,
                   DurationUtil::durationToMilliseconds(scale_timer.min_timeout()))))
             : Event::ScaledTimerMinimum(
                   Event::ScaledMinimum(UnitFloat(scale_timer.min_scale().value() / 100.0)));
+
+    // create entry for per scale timer triggers for timer Type
+    if (scale_timer.has_scaled_triggers()) {
+      auto scaled_triggers_or_error =
+          OverloadAction::create(scale_timer.scaled_triggers(), stats_scope);
+      RETURN_IF_NOT_OK(scaled_triggers_or_error.status());
+      // TODO : timer needs to be string
+      const auto name = scale_timer.timer();
+      const auto symbol_ = scaled_trigger_action_symbol_table_.get(name);
+      auto result = actions_.try_emplace(symbol_, std::move(*scaled_triggers_or_error));
+      if (!result.second) {
+        creation_status =
+            absl::InvalidArgumentError(absl::StrCat("Duplicate overload action ", name));
+        return;
+      }
+    }
 
     auto [_, inserted] = timer_map.insert(std::make_pair(timer_type, minimum));
     UNREFERENCED_PARAMETER(_);
@@ -288,6 +307,28 @@ OverloadAction::create(const envoy::config::overload::v3::OverloadAction& config
       std::unique_ptr<OverloadAction>(new OverloadAction(config, stats_scope, creation_status));
   RETURN_IF_NOT_OK(creation_status);
   return ret;
+}
+
+OverloadAction::OverloadAction(
+    const envoy::config::overload::v3::ScaleTimersOverloadActionConfig::ScaleTimer& scaled_triggers,
+    Stats::Scope& stats_scope)
+    : state_(OverloadActionState::inactive()),
+      active_gauge_(
+          makeGauge(stats_scope, config.name(), "active", Stats::Gauge::ImportMode::NeverImport)),
+      scale_percent_gauge_(makeGauge(stats_scope, config.name(), "scale_percent",
+                                     Stats::Gauge::ImportMode::NeverImport)) {
+  for (const auto& scale_factorstrigger_config : config.time_scale_factors()) {
+    absl::StatusOr<TriggerPtr> trigger_or_error = createTriggerFromConfig(trigger_config);
+    SET_AND_RETURN_IF_NOT_OK(trigger_or_error.status(), creation_status);
+    if (!triggers_.try_emplace(trigger_config.name(), std::move(*trigger_or_error)).second) {
+      creation_status = absl::InvalidArgumentError(
+          absl::StrCat("Duplicate trigger resource for overload action ", config.name()));
+      return;
+    }
+  }
+
+  active_gauge_.set(0);
+  scale_percent_gauge_.set(0);
 }
 
 OverloadAction::OverloadAction(const envoy::config::overload::v3::OverloadAction& config,
@@ -505,10 +546,35 @@ OverloadManagerImpl::OverloadManagerImpl(Event::Dispatcher& dispatcher, Stats::S
     }
 
     if (name == OverloadActionNames::get().ReduceTimeouts) {
-      auto timer_or_error = parseTimerMinimums(action.typed_config(), validation_visitor);
+      auto timer_or_error = parseTimerMinimums(action.typed_config(), validation_visitor,
+                                               stats_scope, action_symbol_table_, actions_);
       SET_AND_RETURN_IF_NOT_OK(timer_or_error.status(), creation_status);
       timer_minimums_ =
           std::make_shared<const Event::ScaledTimerTypeMap>(std::move(*timer_or_error));
+
+      // register per timer triggers in resources_to_actions_
+      // only for reduce timeout
+      for (const auto& scaled_timer : action.timer_scaled_factors()) {
+	      const std::string& timer_type = scaled_timer.timer(); 
+        for (const auto& scaled_trigger : scaled_timer.scaled_triggers()) {
+
+          const std::string& scaled_trigger_resource_ = str::StrCat(timer_type, "_",  scaled_trigger.name());
+          auto proactive_resource_it =
+              OverloadProactiveResources::get().proactive_action_name_to_resource_.find(scaled_trigger_resource_);
+	  
+	  // TODO checck this condition for IF
+          if (resources_.find(scaled_trigger_resource_) == resources_.end() &&
+              proactive_resource_it ==
+                  OverloadProactiveResources::get().proactive_action_name_to_resource_.end()) {
+            creation_status = absl::InvalidArgumentError(
+                fmt::format("Unknown trigger resource {} for overload action {}", scaled_trigger_resource_, name));
+            return;
+          }
+          // symbol -> ReduceTimout
+	  // scaled_ -> getting trigger name 
+          resource_to_actions_.insert(std::make_pair(scaled_trigger_resource_, symbol));
+        }
+      }
     } else if (name == OverloadActionNames::get().ResetStreams) {
       if (!config.has_buffer_factory_config()) {
         creation_status = absl::InvalidArgumentError(
@@ -522,6 +588,7 @@ OverloadManagerImpl::OverloadManagerImpl(Event::Dispatcher& dispatcher, Stats::S
       return;
     }
 
+    // both cfunction can be combined
     for (const auto& trigger : action.triggers()) {
       const std::string& resource = trigger.name();
       auto proactive_resource_it =
@@ -537,28 +604,29 @@ OverloadManagerImpl::OverloadManagerImpl(Event::Dispatcher& dispatcher, Stats::S
       resource_to_actions_.insert(std::make_pair(resource, symbol));
     }
   }
+}
 
-  // Validate the trigger resources for Load shedPoints.
-  for (const auto& point : config.loadshed_points()) {
-    for (const auto& trigger : point.triggers()) {
-      if (!resources_.contains(trigger.name())) {
-        creation_status = absl::InvalidArgumentError(fmt::format(
-            "Unknown trigger resource {} for loadshed point {}", trigger.name(), point.name()));
-        return;
-      }
-    }
-
-    auto load_shed_or_error =
-        LoadShedPointImpl::create(point, api.rootScope(), api.randomGenerator());
-    SET_AND_RETURN_IF_NOT_OK(load_shed_or_error.status(), creation_status);
-    const auto result = loadshed_points_.try_emplace(point.name(), *std::move(load_shed_or_error));
-
-    if (!result.second) {
-      creation_status =
-          absl::InvalidArgumentError(absl::StrCat("Duplicate loadshed point ", point.name()));
+// Validate the trigger resources for Load shedPoints.
+for (const auto& point : config.loadshed_points()) {
+  for (const auto& trigger : point.triggers()) {
+    if (!resources_.contains(trigger.name())) {
+      creation_status = absl::InvalidArgumentError(fmt::format(
+          "Unknown trigger resource {} for loadshed point {}", trigger.name(), point.name()));
       return;
     }
   }
+
+  auto load_shed_or_error =
+      LoadShedPointImpl::create(point, api.rootScope(), api.randomGenerator());
+  SET_AND_RETURN_IF_NOT_OK(load_shed_or_error.status(), creation_status);
+  const auto result = loadshed_points_.try_emplace(point.name(), *std::move(load_shed_or_error));
+
+  if (!result.second) {
+    creation_status =
+        absl::InvalidArgumentError(absl::StrCat("Duplicate loadshed point ", point.name()));
+    return;
+  }
+}
 }
 
 void OverloadManagerImpl::start() {
@@ -636,6 +704,7 @@ bool OverloadManagerImpl::registerForAction(const std::string& action,
 }
 
 ThreadLocalOverloadState& OverloadManagerImpl::getThreadLocalOverloadState() { return *tls_; }
+
 Event::ScaledRangeTimerManagerFactory OverloadManagerImpl::scaledTimerFactory() {
   return [this](Event::Dispatcher& dispatcher) {
     auto manager = createScaledRangeTimerManager(dispatcher, timer_minimums_);
@@ -669,7 +738,8 @@ void OverloadManagerImpl::updateResourcePressure(const std::string& resource, do
   auto [start, end] = resource_to_actions_.equal_range(resource);
 
   std::for_each(start, end, [&](ResourceToActionMap::value_type& entry) {
-    const NamedOverloadActionSymbolTable::Symbol action = entry.second;
+    const NamedOverloadabslActionSymbolTable::Symbol action = entry.second;
+    // "timer_type _ actions "
     auto action_it = actions_.find(action);
     ASSERT(action_it != actions_.end());
     const OverloadActionState old_state = action_it->second->getState();
@@ -680,6 +750,11 @@ void OverloadManagerImpl::updateResourcePressure(const std::string& resource, do
         ENVOY_LOG(debug, "Overload action {} became {}", action_symbol_table_.name(action),
                   (state.isSaturated() ? "saturated" : "scaling"));
       }
+      // if has scaled triggers is presnet
+      // find timer type hopw to know this? 
+      //     calls the resources fixed heap state
+      //     send callback for that timer
+      //     TimerType resources
 
       // Record the updated value to be sent to workers on the next thread-local-state flush, along
       // with any update callbacks. This might overwrite a previous action state change caused by a
@@ -689,6 +764,7 @@ void OverloadManagerImpl::updateResourcePressure(const std::string& resource, do
       // causes the action to have value B, B would have been the result for whichever order the
       // updates to resources 1 and 2 came in.
       state_updates_to_flush_.insert_or_assign(action, state);
+      // this state should be differnet maybe regenerated as per trigger state is now differnet
       auto [callbacks_start, callbacks_end] = action_to_callbacks_.equal_range(action);
       std::for_each(callbacks_start, callbacks_end, [&](ActionToCallbackMap::value_type& cb_entry) {
         callbacks_to_flush_.insert_or_assign(&cb_entry.second, state);
