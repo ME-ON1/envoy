@@ -43,7 +43,8 @@ class OverloadAction {
 public:
   static absl::StatusOr<std::unique_ptr<OverloadAction>>
   create(const envoy::config::overload::v3::OverloadAction& config, Stats::Scope& stats_scope);
-  create(const envoy::config::overload::v3::ScaleTimersOverloadActionConfig& config, Stats::Scope& stats_scope);
+  create(const envoy::config::overload::v3::ScaleTimersOverloadActionConfig& config,
+         Stats::Scope& stats_scope);
 
   // Updates the current pressure for the given resource and returns whether the action
   // has changed state.
@@ -241,7 +242,14 @@ private:
 
   absl::flat_hash_map<NamedOverloadActionSymbolTable::Symbol, OverloadActionState>
       state_updates_to_flush_;
-  absl::flat_hash_map<ActionCallback*, OverloadActionState> callbacks_to_flush_;
+
+  struct OverloadScaleContext {
+  	OverloadAction state_; 
+	absl::optional<Event::ScaledTimerType> timer_type_ ;
+  };
+
+
+  absl::flat_hash_map<ActionCallback*, OverloadScaleContext> callbacks_to_flush_;
   FlushEpochId flush_epoch_ = 0;
   uint64_t flush_awaiting_updates_ = 0;
 
@@ -249,7 +257,8 @@ private:
       std::unordered_multimap<std::string, NamedOverloadActionSymbolTable::Symbol>;
   ResourceToActionMap resource_to_actions_;
 
-  using ActionTableMap =  absl::node_hash_map<NamedOverloadActionSymbolTable::Symbol, std::unique_ptr<OverloadAction>>;
+  using ActionTableMap =
+      absl::node_hash_map<NamedOverloadActionSymbolTable::Symbol, std::unique_ptr<OverloadAction>>;
 
   using ActionToCallbackMap =
       std::unordered_multimap<NamedOverloadActionSymbolTable::Symbol, ActionCallback,
